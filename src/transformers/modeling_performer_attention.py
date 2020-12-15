@@ -24,6 +24,103 @@ SHORT_SEQUENCE_BEHAVIOR_CALLABLES = {
     'never_use_softmax': lambda L, M, training: False
 }
 
+
+class CausalNumerator(torch.autograd.Function):
+    """
+    Computes not-normalized FAVOR causal attention A_{masked}V
+    Args:
+        L: seq_length, B: batch, H: head, M: num_feature, D: dim_per_head
+        q_prime: query_prime tensor of the shape [L,B,H,M].
+        k_prime: key_prime tensor of the shape [L,B,H,M].
+        v: value tensor of the shape [L,B,H,D].
+    Returns:
+        Not-normalized FAVOR causal attention A_{masked}V.
+        shape: [L,B,H,D].
+    """
+    @staticmethod
+    def forward(ctx, q_prime, k_prime, v):
+        result = []
+        sums = torch.zeros_like(torch.einsum("ijk,ijl->ijkl", k_prime[0], v[0]))
+        for index in range(q_prime.shape[0]):
+            sums = sums + torch.einsum("ijk,ijl->ijkl", k_prime[index], v[index])
+            result.append(torch.einsum("ijkl,ijk->ijl", sums, q_prime[index])[None, Ellipsis])
+
+        ctx.save_for_backward(q_prime, k_prime, v, sums)
+        result = torch.cat(result, dim=0)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_outputs):
+        q_prime, k_prime, v, sums = ctx.saved_tensors
+
+        grads = torch.zeros_like(torch.einsum("ijk,ijl->ijkl", k_prime[0], v[0]))
+
+        gr_sums = sums
+
+        q_grads = []
+        k_grads = []
+        v_grads = []
+
+        for index in range(q_prime.shape[0] - 1, -1, -1):
+            q_grads.append(
+                torch.einsum("ijkl,ijl->ijk", gr_sums, grad_outputs[index])[None, Ellipsis])
+            grads = grads + torch.einsum("ijk,ijl->ijkl", q_prime[index], grad_outputs[index])
+            k_grads.append(torch.einsum("ijkl,ijl->ijk", grads, k_prime[index])[None, Ellipsis])
+            v_grads.append(torch.einsum("ijkl,ijk->ijl", grads, k_prime[index])[None, Ellipsis])
+            gr_sums = gr_sums - torch.einsum("ijk,ijl->ijkl", k_prime[index], v[index])
+
+        q_grads = torch.cat(q_grads[::-1], dim=0)
+        k_grads = torch.cat(k_grads[::-1], dim=0)
+        v_grads = torch.cat(v_grads[::-1], dim=0)
+        return q_grads, k_grads, v_grads
+
+
+class CausalDenominator(torch.autograd.Function):
+    """Computes FAVOR normalizer in causal attention.
+      Args:
+        q_prime: query_prime tensor of the shape [L,B,H,M].
+        k_prime: key_prime tensor of the shape [L,B,H,M].
+      Returns:
+        FAVOR normalizer in causal attention. [L,B,H]
+      """
+    @staticmethod
+    def forward(ctx, q_prime, k_prime):
+        result = []
+        # shape: [M, ]
+        sums = torch.zeros_like(k_prime[0])
+
+        for index in range(q_prime.shape[0]):
+            sums = sums + k_prime[index]
+            result.append(torch.sum(q_prime[index] * sums, dim=2)[None, Ellipsis])
+        ctx.save_for_backward(q_prime, k_prime, sums)
+        result = torch.cat(result, dim=0)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_outputs):
+        q_prime, k_prime, sums = ctx.saved_tensors
+        k_grad = torch.zeros_like(k_prime[0])
+
+        gr_sums = sums
+
+        q_grads = []
+        k_grads = []
+
+        for index in range(q_prime.shape[0] - 1, -1, -1):
+            q_grads.append(
+                torch.einsum("ijk,ij->ijk", gr_sums, grad_outputs[index])[None, Ellipsis])
+            k_grad = k_grad + torch.einsum("ijk,ij->ijk", q_prime[index], grad_outputs[index])
+            k_grads.append(k_grad[None, Ellipsis][None, Ellipsis])
+            gr_sums = gr_sums - k_prime[index]
+
+        q_grads = torch.cat(q_grads[::-1], dim=0)
+        k_grads = torch.cat(k_grads[::-1], dim=0)
+        return q_grads, k_grads
+
+causal_numerator = CausalNumerator.apply
+causal_denominator = CausalDenominator.apply
+
+
 class PerformerAttention(nn.Module):
     def __init__(self, config: Optional[Union[dict, PerformerAttentionConfig]] = None, **kwargs):
         super().__init__()
@@ -148,7 +245,13 @@ class PerformerAttention(nn.Module):
             if mask is not None:
                 mask = (mask == 0).view(mask_reshp).expand_as(scores)  # (bs, num_heads, q_length, k_length)
                 scores.masked_fill_(mask, -float("inf"))  # (bs, num_heads, q_length, k_length)
-            
+
+            if self.causal:
+                attention_mask = torch.tril(torch.ones(q_length, q_length)).view(1, 1, q_length, q_length)
+                # (bs, num_heads, q_length, k_length)
+                attention_mask = (attention_mask == 0).expand_as(scores)
+                scores.masked_fill_(attention_mask, -float("inf"))  # (bs, num_heads, q_length, k_length)
+
             attn_map = nn.Softmax(dim=-1)(scores)
             attn_map = self.dropout(attn_map)  # (bs, num_heads, q_length, k_length)
             return self._finalize_attention_output(attn_map @ v, head_mask, attn_map)
@@ -210,23 +313,63 @@ class PerformerAttention(nn.Module):
             return (self.kernel_fn(x) + self.kernel_epsilon for x in (projected_q, projected_k))
     
     def compute_attention_with_projected_queries_and_keys(self, q_prime, k_prime, v, mask = None, head_mask = None):
+        # q_prime, k_prime (bs, num_heads, q_length, num_features)
+        # v (bs, num_heads, q_length, dim_per_head)
+        # mask (bs, seq_length)
+
         # Apply the padding mask to K'. Also applying it to Q' would be redundant.
         if mask is not None:
+            # mask: (bs, 1, q_length, 1) -> (bs, num_heads, q_length, num_features)
             k_prime *= mask.unsqueeze(1).unsqueeze(-1).expand_as(k_prime)
-        
+
+        # (bs, num_heads, num_features, q_length)
         k_prime_t = k_prime.transpose(-2, -1)
-        output = q_prime @ (k_prime_t @ v)
-        
+
+        # q_prime, k_prime shape: (bs, num_heads, q_length, num_features)
+        # v shape: (bs, num_heads, q_length, dim_per_head)
+        # output: (bs, num_heads, q_length, dim_per_head)
+
+        def _reshape(x):
+            # (bs, num_heads, q_length, x) - >(q_length, bs, num_head, x)
+            return torch.einsum('bhlx->lbhx', x)
+
+        def _dereshape(x):
+            return torch.einsum('lbhx->bhlx', x)
+
+        if self.casual:
+            # q_prime: query_prime tensor of the shape [L,B,H,M].
+            # k_prime: key_prime tensor of the shape [L,B,H,M].
+            # v: value tensor of the shape [L,B,H,D].
+            q_prime, k_prime, v = (_reshape(x) for x in (q_prime, k_prime, v))
+            output = causal_numerator(q_prime, k_prime, v)  # [L,B,H,D].
+            output = torch.einsum('lbhd->bhld', output)  # (bs, num_heads, q_length, dim_per_head)
+            q_prime, k_prime, v = (_dereshape(x) for x in (q_prime, k_prime, v))
+
+        else:
+            output = q_prime @ (k_prime_t @ v)  # (bs, num_heads, q_length, dim_per_head)
+
         # Ensure that the output vectors are convex combinations of input vectors; that is,
         # the implied attention scores sum to 1
-        if self.normalize_output:    
+        if self.normalize_output:
             # Equivalent to multiplying K'^T by a ones vector
-            d = q_prime @ k_prime.sum(dim=-2).unsqueeze(-1)
-            
+            if self.casual:
+                # q_prime: query_prime tensor of the shape [L,B,H,M].
+                # k_prime: key_prime tensor of the shape [L,B,H,M].
+                q_prime, k_prime = (_reshape(x) for x in (q_prime, k_prime))
+                d = causal_denominator(q_prime, k_prime)  # [L,B,H]
+                d = torch.einsum('lbh->bhl', d).unsqueeze(-1)  # (bs, num_head, q_length, 1)
+                # q_prime, k_prime shape: (bs, num_heads, q_length, num_features)
+                q_prime, k_prime = (_dereshape(x) for x in (q_prime, k_prime))
+
+            else:
+                # d shape: (bs, num_head, q_length, 1)
+                d = q_prime @ k_prime.sum(dim=-2).unsqueeze(-1)
+
             # Avoid dividing by very small numbers
             d += 2 * self.normalization_stabilizer * (torch.abs(d) <= self.normalization_stabilizer)
             output /= d
-        
+
+        # output: (bs, num_heads, q_length, dim_per_head)
         return self._finalize_attention_output(output, head_mask)
     
     def _finalize_attention_output(self, context, head_mask=None, att_map_to_output=None):

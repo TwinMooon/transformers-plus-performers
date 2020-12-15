@@ -80,7 +80,8 @@ class PerformerAttentionConfig:
     feature_redraw_interval: int = 1000
     redraw_stochastically: bool = False
     redraw_verbose: bool = False
-    
+    casual: bool = False
+
     # Optional here so the user doesn't have to set redundant parameters, but must be set by model before config is
     # passed to PerformerAttention.__init__()
     d_model: Optional[int] = None
